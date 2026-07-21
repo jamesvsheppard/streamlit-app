@@ -14,9 +14,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Alert Source Overlap", layout="wide")
 
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "overlap_results.csv")
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sheets", "overlap_results.csv")
 
-# the four integer count columns -> friendly labels used in selectors / axis titles
+# the base integer count columns -> friendly labels used in selectors / axis titles
 METRICS = {
     "total_alerts": "Total alerts",
     "dupes_between_vh_curate": "Dupes between VH & Curate",
@@ -28,8 +28,26 @@ METRICS = {
 PCT_COL = "pct_dupes_between_vh_curate"
 PCT_LABEL = "% dupes between VH & Curate"
 
-# everything rankable in the chart: the 4 counts plus the share %
-RANKABLE = {**METRICS, PCT_COL: PCT_LABEL}
+# who-was-first columns (integer counts, per cross-source duplicate event)
+FIRST_COLS = {
+    "dupe_alerts_received_first": "Dupe alerts received first",
+    "dupe_alerts_received_same_date": "Dupe alerts received same date",
+}
+
+# all integer columns to coerce on load; count columns shown in tooltips
+INT_COLS = list(METRICS) + list(FIRST_COLS)
+COUNT_LABELS = {**METRICS, **FIRST_COLS}
+
+# everything rankable in the chart, in display order: counts + share %
+RANKABLE = {
+    "total_alerts": "Total alerts",
+    "dupes_between_vh_curate": "Dupes between VH & Curate",
+    PCT_COL: PCT_LABEL,
+    "dupe_alerts_received_first": "Dupe alerts received first",
+    "dupe_alerts_received_same_date": "Dupe alerts received same date",
+    "dupes_within_vh": "Dupes within Voterheads",
+    "dupes_within_curate": "Dupes within Curate",
+}
 
 DEFINITION_ORDER = [
     "Same URL",
@@ -43,7 +61,7 @@ DEFINITION_ORDER = [
 @st.cache_data
 def load_data(path):
     df = pd.read_csv(path)
-    for col in METRICS:
+    for col in INT_COLS:
         df[col] = df[col].astype(int)
     # derive the share % if an older export doesn't already include it
     if PCT_COL not in df.columns:
@@ -109,7 +127,8 @@ with tab_tables:
         "Sort by it (descending) to find counties whose alerts are most duplicative across sources."
     )
     display_cols = ["county", "state", "source", "total_alerts", "dupes_between_vh_curate",
-                    PCT_COL, "dupes_within_vh", "dupes_within_curate"]
+                    PCT_COL, "dupe_alerts_received_first", "dupe_alerts_received_same_date",
+                    "dupes_within_vh", "dupes_within_curate"]
     pct_config = {PCT_COL: st.column_config.NumberColumn(PCT_LABEL, format="%.1f%%")}
     for i, defn in enumerate(definitions):
         sub = filtered[filtered["definition"] == defn][display_cols].reset_index(drop=True)
@@ -158,7 +177,7 @@ with tab_chart:
                     alt.Tooltip("county:N"),
                     alt.Tooltip("state:N"),
                     alt.Tooltip("source:N"),
-                    *[alt.Tooltip(f"{c}:Q", title=METRICS[c]) for c in METRICS],
+                    *[alt.Tooltip(f"{c}:Q", title=lbl) for c, lbl in COUNT_LABELS.items()],
                     alt.Tooltip(f"{PCT_COL}:Q", title=PCT_LABEL, format=".1f"),
                 ],
             )
@@ -169,7 +188,8 @@ with tab_chart:
         with st.expander("Show the top-20 rows as a table"):
             st.dataframe(
                 top[["county", "state", "source", "total_alerts", "dupes_between_vh_curate",
-                     PCT_COL, "dupes_within_vh", "dupes_within_curate"]],
+                     PCT_COL, "dupe_alerts_received_first", "dupe_alerts_received_same_date",
+                     "dupes_within_vh", "dupes_within_curate"]],
                 width="stretch", hide_index=True,
                 column_config={PCT_COL: st.column_config.NumberColumn(PCT_LABEL, format="%.1f%%")},
             )
@@ -214,6 +234,8 @@ event occurs.
 | **total_alerts** | Every alert received from that source for that county/state (independent of any duplicate logic). |
 | **dupes_between_vh_curate** | Alerts from that source whose dupe-key **also appears in the other source** — i.e. the same event was reported by both Voterheads and Curate. |
 | **pct_dupes_between_vh_curate** | `dupes_between_vh_curate ÷ total_alerts`, as a **percentage** — the share of a source's alerts that are duplicated across sources. Use it to rank counties by how *proportionally* duplicative their alerts are. |
+| **dupe_alerts_received_first** | For each cross-source duplicate event, the two providers' `post_date`s are compared. This counts the events where **this source posted first**. (Voterheads-first events show up on the Voterheads row, Curate-first on the Curate row.) |
+| **dupe_alerts_received_same_date** | Cross-source duplicate events where **both providers posted on the same `post_date`**. Counted on *both* the Voterheads and Curate rows, so the value matches across the two. |
 | **dupes_within_vh** | Voterheads alerts whose dupe-key repeats **within Voterheads**. Always 0 on Curate rows. |
 | **dupes_within_curate** | Curate alerts whose dupe-key repeats **within Curate**. Always 0 on Voterheads rows. |
         """
@@ -224,6 +246,12 @@ event occurs.
         """
 - The three dupe columns are **independent comparison types**, so a single alert can be
   counted in more than one (e.g. a repeated URL that also appears in the other source).
+- **`dupe_alerts_received_first` / `dupe_alerts_received_same_date` are counted per cross-source
+  *event*** (one point per duplicated event), whereas `dupes_between_vh_curate` counts individual
+  alerts. Cross-source dupes are almost always one Voterheads row to one Curate row, so the two
+  line up in practice. When a definition already includes `post_date` in its key (e.g.
+  *Same URL + post_date*), every cross-source match is a tie by construction, so
+  `received_first` is 0 and everything lands in `received_same_date`.
 - **`pct_dupes_between_vh_curate` is sensitive to volume**: a county with 1 alert that
   happens to overlap reads as 100%. On the Bar chart tab, raise **Min. total alerts** to
   focus on counties with enough volume for the share to be meaningful.
