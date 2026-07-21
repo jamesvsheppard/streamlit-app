@@ -14,7 +14,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Alert Source Overlap", layout="wide")
 
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sheets", "overlap_results.csv")
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "overlap_results.csv")
 
 # the base integer count columns -> friendly labels used in selectors / axis titles
 METRICS = {
