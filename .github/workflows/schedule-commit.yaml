@@ -1,0 +1,28 @@
+name: Scheduled Empty Commit (hopefully keeps Streamlit app alive)
+
+on:
+  schedule:
+    # Day 1: 00:00, 10:00, 20:00
+    - cron: '0 0,10,20 * * *'
+    # Day 2: 06:00, 16:00 (Offsets to keep the strict 10-hour gap)
+    - cron: '0 6,16 * * *'
+  workflow_dispatch:
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Crucial for pushing the commit
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@://github.com"
+
+      - name: Create and Push Empty Commit
+        run: |
+          git commit --allow-empty -m "Chore: 10-hour scheduled empty commit"
+          git push origin main
