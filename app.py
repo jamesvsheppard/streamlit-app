@@ -14,7 +14,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Alert Source Overlap", layout="wide")
 
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "overlap_results.csv")
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sheets", "overlap_results.csv")
 
 # the base integer count columns -> friendly labels used in selectors / axis titles
 METRICS = {
@@ -53,8 +53,6 @@ DEFINITION_ORDER = [
     "Same URL",
     "Same URL + post_date",
     "Same URL + meeting_date",
-    "Same post_date + milestone_type",
-    "Same meeting_date + milestone_type",
 ]
 
 
@@ -90,17 +88,19 @@ if not os.path.exists(DATA_PATH):
     st.stop()
 
 data = load_data(DATA_PATH)
+# keep only the definitions this app surfaces (drops any others still in the export)
+data = data[data["definition"].isin(DEFINITION_ORDER)].copy()
 definitions = [d for d in DEFINITION_ORDER if d in data["definition"].unique()]
 
 st.title("Alert Source Overlap Explorer")
 st.caption(
     "Duplicate alerts between and within Voterheads & Curate, at the county/state/source level, "
-    "under five different definitions of a duplicate."
+    "under three different definitions of a duplicate."
 )
 
 # ---------------------------------------------------------------- sidebar filters (apply to both data tabs)
 st.sidebar.header("Filters")
-st.sidebar.caption("Applied to the Data tables and Bar chart tabs. Leave a filter empty to include everything.")
+st.sidebar.caption("Applied to every tab. Leave a filter empty to include everything.")
 
 state_opts = sorted(data["state"].dropna().unique())
 sel_states = st.sidebar.multiselect("State", state_opts)
@@ -115,7 +115,53 @@ sel_sources = st.sidebar.multiselect("Source", source_opts)
 
 filtered = apply_filters(data, sel_states, sel_counties, sel_sources)
 
-tab_tables, tab_chart, tab_about = st.tabs(["Data tables", "Bar chart", "About the metrics"])
+tab_overview, tab_tables, tab_chart, tab_about = st.tabs(
+    ["Overview", "Data tables", "Bar chart", "About the metrics"])
+
+# ================================================================ Tab 0: overview
+with tab_overview:
+    st.subheader("At-a-glance overview")
+    ov_def = st.selectbox(
+        "Duplicate definition", definitions, key="ov_def",
+        help="Duplicate counts depend on the definition — the totals below use this one.",
+    )
+    ov = filtered[filtered["definition"] == ov_def]
+
+    dupe_cols = ["dupes_between_vh_curate", "dupes_within_vh", "dupes_within_curate"]
+    total_dupes = int(ov[dupe_cols].sum().sum())
+
+    # county/state pairs that got alerts but have zero duplicates of any kind
+    per_county = (ov.assign(_dupes=ov[dupe_cols].sum(axis=1))
+                    .groupby(["county", "state"])
+                    .agg(alerts=("total_alerts", "sum"), dupes=("_dupes", "sum")))
+    counties_no_dupes = int(((per_county["alerts"] > 0) & (per_county["dupes"] == 0)).sum())
+
+    vh_first = int(ov.loc[ov["source"] == "Voterheads", "dupe_alerts_received_first"].sum())
+    cu_first = int(ov.loc[ov["source"] == "Curate", "dupe_alerts_received_first"].sum())
+    vh_within = int(ov["dupes_within_vh"].sum())
+    cu_within = int(ov["dupes_within_curate"].sum())
+
+    r1a, r1b = st.columns(2)
+    r1a.metric(
+        "Total duplicate alerts", f"{total_dupes:,}",
+        help="dupes_between_vh_curate + dupes_within_vh + dupes_within_curate, summed over every "
+             "row. A duplicated alert is counted once per row, so it can be counted multiple times.",
+    )
+    r1b.metric(
+        "Counties with alerts but no dupes", f"{counties_no_dupes:,}",
+        help="County/state pairs that received at least one alert but have zero duplicates of any "
+             "kind under this definition.",
+    )
+
+    st.markdown("**Cross-source alerts received first** — who posted earlier when both providers caught the same event")
+    r2a, r2b = st.columns(2)
+    r2a.metric("Voterheads received first", f"{vh_first:,}")
+    r2b.metric("Curate received first", f"{cu_first:,}")
+
+    st.markdown("**Duplicates within a single source** — repeated alerts from the same provider")
+    r3a, r3b = st.columns(2)
+    r3a.metric("Dupes within Voterheads", f"{vh_within:,}")
+    r3b.metric("Dupes within Curate", f"{cu_within:,}")
 
 # ================================================================ Tab 1: data tables
 with tab_tables:
@@ -137,21 +183,26 @@ with tab_tables:
 
 # ================================================================ Tab 2: bar chart
 with tab_chart:
-    st.subheader("Top 20 counties by metric")
+    st.subheader("Ranked counties")
 
     c1, c2, c3 = st.columns([2, 2, 1])
     sel_def = c1.selectbox("Duplicate definition", definitions, key="chart_def")
     metric = c2.selectbox(
-        "Rank by (descending)",
-        list(RANKABLE),
-        format_func=lambda c: RANKABLE[c],
-        key="chart_metric",
+        "Rank by", list(RANKABLE), format_func=lambda c: RANKABLE[c], key="chart_metric",
     )
     min_total = c3.number_input(
         "Min. total alerts", min_value=1, value=1, step=1, key="chart_min_total",
         help="Ignore counties with fewer than this many alerts. Useful when ranking by "
-             "share % so low-volume counties sitting at 100% don't dominate the top 20.",
+             "share % so low-volume counties sitting at 100% don't dominate the ranking.",
     )
+
+    c4, c5 = st.columns([2, 2])
+    order = c4.radio(
+        "Order", ["Top (highest first)", "Bottom (lowest first)"],
+        horizontal=True, key="chart_order",
+    )
+    n_rows = c5.slider("Rows to show", min_value=5, max_value=50, value=20, step=5, key="chart_rows")
+    ascending = order.startswith("Bottom")
 
     chart_df = filtered[(filtered["definition"] == sel_def)
                         & (filtered["total_alerts"] >= min_total)].copy()
@@ -164,14 +215,15 @@ with tab_chart:
             + ", " + chart_df["state"].astype(str)
             + " (" + chart_df["source"] + ")"
         )
-        top = chart_df.sort_values(metric, ascending=False).head(20)
+        rows = chart_df.sort_values(metric, ascending=ascending).head(n_rows)
+        st.markdown(f"**{'Bottom' if ascending else 'Top'} {len(rows)} by {RANKABLE[metric]}**")
 
         chart = (
-            alt.Chart(top)
+            alt.Chart(rows)
             .mark_bar()
             .encode(
                 x=alt.X(f"{metric}:Q", title=RANKABLE[metric]),
-                y=alt.Y("label:N", sort="-x", title=None),
+                y=alt.Y("label:N", sort=("x" if ascending else "-x"), title=None),
                 color=alt.Color("source:N", title="Source"),
                 tooltip=[
                     alt.Tooltip("county:N"),
@@ -181,15 +233,15 @@ with tab_chart:
                     alt.Tooltip(f"{PCT_COL}:Q", title=PCT_LABEL, format=".1f"),
                 ],
             )
-            .properties(height=max(300, 26 * len(top)))
+            .properties(height=max(300, 26 * len(rows)))
         )
         st.altair_chart(chart, width="stretch")
 
-        with st.expander("Show the top-20 rows as a table"):
+        with st.expander(f"Show these {len(rows)} rows as a table"):
             st.dataframe(
-                top[["county", "state", "source", "total_alerts", "dupes_between_vh_curate",
-                     PCT_COL, "dupe_alerts_received_first", "dupe_alerts_received_same_date",
-                     "dupes_within_vh", "dupes_within_curate"]],
+                rows[["county", "state", "source", "total_alerts", "dupes_between_vh_curate",
+                      PCT_COL, "dupe_alerts_received_first", "dupe_alerts_received_same_date",
+                      "dupes_within_vh", "dupes_within_curate"]],
                 width="stretch", hide_index=True,
                 column_config={PCT_COL: st.column_config.NumberColumn(PCT_LABEL, format="%.1f%%")},
             )
@@ -208,7 +260,7 @@ duplicate group is counted.
         """
     )
 
-    st.markdown("#### The five definitions of a duplicate")
+    st.markdown("#### The three definitions of a duplicate")
     st.markdown(
         """
 Each definition changes which columns must match for two alerts to be considered the same:
@@ -218,8 +270,6 @@ Each definition changes which columns must match for two alerts to be considered
 | **Same URL** | the same `url` |
 | **Same URL + post_date** | the same `url` **and** `post_date` |
 | **Same URL + meeting_date** | the same `url` **and** `meeting_date` |
-| **Same post_date + milestone_type** | the same `post_date` **and** `milestone_type` |
-| **Same meeting_date + milestone_type** | the same `meeting_date` **and** `milestone_type` |
 
 `post_date` is when the alert was published; `meeting_date` is when the actual
 event occurs.
@@ -255,9 +305,12 @@ event occurs.
 - **`pct_dupes_between_vh_curate` is sensitive to volume**: a county with 1 alert that
   happens to overlap reads as 100%. On the Bar chart tab, raise **Min. total alerts** to
   focus on counties with enough volume for the share to be meaningful.
-- Rows whose dupe-key contains a **null** (e.g. a missing `meeting_date` or
-  `milestone_type`) are excluded from duplicate consideration but still count toward
-  `total_alerts` — an unknown value isn't treated as a confident match.
-- Rows with a **null county** are dropped entirely, since county/state is the grouping key.
+- Rows whose dupe-key contains a **null** (e.g. a missing `meeting_date`) are excluded from
+  duplicate consideration but still count toward `total_alerts` — an unknown value isn't
+  treated as a confident match.
+- The dataset is built on the **full county list**, so every county/state appears even with
+  **zero alerts** (all counts 0). Alert pairs that only showed up as fuzzy-match artifacts
+  (a county/state not in the list) are excluded. The **Overview** tab's metrics and the
+  **Bar chart** exclude these zero-alert rows once you set *Min. total alerts* ≥ 1 (the default).
         """
     )
