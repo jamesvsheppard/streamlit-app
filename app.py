@@ -20,8 +20,7 @@ DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ov
 METRICS = {
     "total_alerts": "Total alerts",
     "dupes_between_vh_curate": "Dupes between VH & Curate",
-    "dupes_within_vh": "Dupes within Voterheads",
-    "dupes_within_curate": "Dupes within Curate",
+    "dupes_within_source": "Dupes within source",
 }
 
 # derived share column (float %): dupes_between_vh_curate / total_alerts
@@ -45,8 +44,7 @@ RANKABLE = {
     PCT_COL: PCT_LABEL,
     "dupe_alerts_received_first": "Dupe alerts received first",
     "dupe_alerts_received_same_date": "Dupe alerts received same date",
-    "dupes_within_vh": "Dupes within Voterheads",
-    "dupes_within_curate": "Dupes within Curate",
+    "dupes_within_source": "Dupes within source",
 }
 
 DEFINITION_ORDER = [
@@ -127,7 +125,7 @@ with tab_overview:
     )
     ov = filtered[filtered["definition"] == ov_def]
 
-    dupe_cols = ["dupes_between_vh_curate", "dupes_within_vh", "dupes_within_curate"]
+    dupe_cols = ["dupes_between_vh_curate", "dupes_within_source"]
     total_dupes = int(ov[dupe_cols].sum().sum())
 
     # county/state pairs that got alerts but have zero duplicates of any kind
@@ -138,14 +136,14 @@ with tab_overview:
 
     vh_first = int(ov.loc[ov["source"] == "Voterheads", "dupe_alerts_received_first"].sum())
     cu_first = int(ov.loc[ov["source"] == "Curate", "dupe_alerts_received_first"].sum())
-    vh_within = int(ov["dupes_within_vh"].sum())
-    cu_within = int(ov["dupes_within_curate"].sum())
+    vh_within = int(ov.loc[ov["source"] == "Voterheads", "dupes_within_source"].sum())
+    cu_within = int(ov.loc[ov["source"] == "Curate", "dupes_within_source"].sum())
 
     r1a, r1b = st.columns(2)
     r1a.metric(
         "Total duplicate alerts", f"{total_dupes:,}",
-        help="dupes_between_vh_curate + dupes_within_vh + dupes_within_curate, summed over every "
-             "row. A duplicated alert is counted once per row, so it can be counted multiple times.",
+        help="dupes_between_vh_curate + dupes_within_source, summed over every row. A duplicated "
+             "alert is counted once per row, so it can be counted multiple times.",
     )
     r1b.metric(
         "Counties with alerts but no dupes", f"{counties_no_dupes:,}",
@@ -174,7 +172,7 @@ with tab_tables:
     )
     display_cols = ["county", "state", "source", "total_alerts", "dupes_between_vh_curate",
                     PCT_COL, "dupe_alerts_received_first", "dupe_alerts_received_same_date",
-                    "dupes_within_vh", "dupes_within_curate"]
+                    "dupes_within_source"]
     pct_config = {PCT_COL: st.column_config.NumberColumn(PCT_LABEL, format="%.1f%%")}
     for i, defn in enumerate(definitions):
         sub = filtered[filtered["definition"] == defn][display_cols].reset_index(drop=True)
@@ -241,7 +239,7 @@ with tab_chart:
             st.dataframe(
                 rows[["county", "state", "source", "total_alerts", "dupes_between_vh_curate",
                       PCT_COL, "dupe_alerts_received_first", "dupe_alerts_received_same_date",
-                      "dupes_within_vh", "dupes_within_curate"]],
+                      "dupes_within_source"]],
                 width="stretch", hide_index=True,
                 column_config={PCT_COL: st.column_config.NumberColumn(PCT_LABEL, format="%.1f%%")},
             )
@@ -286,16 +284,15 @@ event occurs.
 | **pct_dupes_between_vh_curate** | `dupes_between_vh_curate ÷ total_alerts`, as a **percentage** — the share of a source's alerts that are duplicated across sources. Use it to rank counties by how *proportionally* duplicative their alerts are. |
 | **dupe_alerts_received_first** | For each cross-source duplicate event, the two providers' `post_date`s are compared. This counts the events where **this source posted first**. (Voterheads-first events show up on the Voterheads row, Curate-first on the Curate row.) |
 | **dupe_alerts_received_same_date** | Cross-source duplicate events where **both providers posted on the same `post_date`**. Counted on *both* the Voterheads and Curate rows, so the value matches across the two. |
-| **dupes_within_vh** | Voterheads alerts whose dupe-key repeats **within Voterheads**. Always 0 on Curate rows. |
-| **dupes_within_curate** | Curate alerts whose dupe-key repeats **within Curate**. Always 0 on Voterheads rows. |
+| **dupes_within_source** | Alerts whose dupe-key repeats **within this row's own source** — repeated alerts from the same provider. (The grain is county/state/source, so the source is the row itself; on a Voterheads row it counts within-Voterheads repeats, on a Curate row within-Curate.) |
         """
     )
 
     st.markdown("#### Notes & caveats")
     st.markdown(
         """
-- The three dupe columns are **independent comparison types**, so a single alert can be
-  counted in more than one (e.g. a repeated URL that also appears in the other source).
+- `dupes_between_vh_curate` and `dupes_within_source` are **independent comparison types**, so a
+  single alert can be counted in both (e.g. a repeated URL that also appears in the other source).
 - **`dupe_alerts_received_first` / `dupe_alerts_received_same_date` are counted per cross-source
   *event*** (one point per duplicated event), whereas `dupes_between_vh_curate` counts individual
   alerts. Cross-source dupes are almost always one Voterheads row to one Curate row, so the two
