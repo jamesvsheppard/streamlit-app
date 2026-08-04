@@ -55,7 +55,10 @@ DEFINITION_ORDER = [
 
 
 @st.cache_data
-def load_data(path):
+def load_data(path, mtime):
+    # mtime (the file's last-modified time) is hashed into the cache key, so rewriting the CSV
+    # invalidates the cache and forces a reload — even when the code itself hasn't changed.
+    # (Note: it must NOT be named with a leading underscore, or Streamlit would skip hashing it.)
     df = pd.read_csv(path)
     for col in INT_COLS:
         df[col] = df[col].astype(int)
@@ -85,7 +88,7 @@ if not os.path.exists(DATA_PATH):
     )
     st.stop()
 
-data = load_data(DATA_PATH)
+data = load_data(DATA_PATH, os.path.getmtime(DATA_PATH))
 # keep only the definitions this app surfaces (drops any others still in the export)
 data = data[data["definition"].isin(DEFINITION_ORDER)].copy()
 definitions = [d for d in DEFINITION_ORDER if d in data["definition"].unique()]
