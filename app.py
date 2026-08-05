@@ -131,11 +131,10 @@ with tab_overview:
     dupe_cols = ["dupes_between_vh_curate", "dupes_within_source"]
     total_dupes = int(ov[dupe_cols].sum().sum())
 
-    # county/state pairs that got alerts but have zero duplicates of any kind
-    per_county = (ov.assign(_dupes=ov[dupe_cols].sum(axis=1))
-                    .groupby(["county", "state"])
-                    .agg(alerts=("total_alerts", "sum"), dupes=("_dupes", "sum")))
-    counties_no_dupes = int(((per_county["alerts"] > 0) & (per_county["dupes"] == 0)).sum())
+    # county/state pairs with at least one duplicate (across sources or within a source)
+    dupes_per_county = (ov.assign(_dupes=ov[dupe_cols].sum(axis=1))
+                          .groupby(["county", "state"])["_dupes"].sum())
+    counties_with_dupes = int((dupes_per_county > 0).sum())
 
     vh_first = int(ov.loc[ov["source"] == "Voterheads", "dupe_alerts_received_first"].sum())
     cu_first = int(ov.loc[ov["source"] == "Curate", "dupe_alerts_received_first"].sum())
@@ -149,9 +148,9 @@ with tab_overview:
              "alert is counted once per row, so it can be counted multiple times.",
     )
     r1b.metric(
-        "Counties with alerts but no dupes", f"{counties_no_dupes:,}",
-        help="County/state pairs that received at least one alert but have zero duplicates of any "
-             "kind under this definition.",
+        "Counties with duplicates", f"{counties_with_dupes:,}",
+        help="Unique county/state pairs with at least one duplicate — across sources "
+             "(dupes_between_vh_curate) or within a source (dupes_within_source) — under this definition.",
     )
 
     st.markdown("**Cross-source alerts received first** — who posted earlier when both providers caught the same event")
