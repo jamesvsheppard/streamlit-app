@@ -7,12 +7,28 @@ Run with:
 Reads sheets/overlap_results.csv, which is exported by the
 alerts_source_overlap.ipynb notebook (the "Export ... for the visualization app" cell).
 """
+import inspect
 import os
 import pandas as pd
 import altair as alt
 import streamlit as st
 
 st.set_page_config(page_title="Alert Source Overlap", layout="wide")
+
+# Streamlit >=1.60 added on-by-default "lazy loading" for large st.dataframe grids. That grid
+# can fail to hydrate on Streamlit Community Cloud, blanking the whole app (white screen +
+# spinner, no Python-side error in the logs). Opt out of it wherever the `lazy` parameter exists
+# so rows render eagerly; on older Streamlit (no such param) this is a no-op.
+try:
+    _DATAFRAME_HAS_LAZY = "lazy" in inspect.signature(st.dataframe).parameters
+except (TypeError, ValueError):
+    _DATAFRAME_HAS_LAZY = False
+
+
+def render_dataframe(df, **kwargs):
+    if _DATAFRAME_HAS_LAZY:
+        kwargs.setdefault("lazy", False)
+    st.dataframe(df, **kwargs)
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "overlap_results.csv")
 
@@ -114,6 +130,10 @@ sel_counties = st.sidebar.multiselect("County", county_opts)
 source_opts = sorted(data["source"].dropna().unique())
 sel_sources = st.sidebar.multiselect("Source", source_opts)
 
+# tiny build indicator — confirms which Streamlit the deploy is actually running (safe to remove)
+st.sidebar.caption(f"streamlit {st.__version__} · dataframe lazy-load: "
+                   f"{'off' if _DATAFRAME_HAS_LAZY else 'n/a'}")
+
 filtered = apply_filters(data, sel_states, sel_counties, sel_sources)
 
 tab_overview, tab_tables, tab_chart, tab_about = st.tabs(
@@ -180,7 +200,7 @@ with tab_tables:
     for i, defn in enumerate(definitions):
         sub = filtered[filtered["definition"] == defn][display_cols].reset_index(drop=True)
         with st.expander(f"{defn}  —  {len(sub):,} rows", expanded=(i == 0)):
-            st.dataframe(sub, width="stretch", hide_index=True, height=360, column_config=pct_config)
+            render_dataframe(sub, width="stretch", hide_index=True, height=360, column_config=pct_config)
 
 # ================================================================ Tab 2: bar chart
 with tab_chart:
@@ -239,7 +259,7 @@ with tab_chart:
         st.altair_chart(chart, width="stretch")
 
         with st.expander(f"Show these {len(rows)} rows as a table"):
-            st.dataframe(
+            render_dataframe(
                 rows[["county", "state", "source", "total_alerts", "dupes_between_vh_curate",
                       PCT_COL, "dupe_alerts_received_first", "dupe_alerts_received_same_date",
                       "dupes_within_source"]],
