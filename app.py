@@ -67,6 +67,8 @@ DEFINITION_ORDER = [
     "Same URL",
     "Same URL + post_date",
     "Same URL + meeting_date",
+    "Same meeting_date",
+    "Same meeting_date + search_term",
 ]
 
 
@@ -112,7 +114,7 @@ definitions = [d for d in DEFINITION_ORDER if d in data["definition"].unique()]
 st.title("Alert Source Overlap Explorer")
 st.caption(
     "Duplicate alerts between and within Voterheads & Curate, at the county/state/source level, "
-    "under three different definitions of a duplicate."
+    "under five different definitions of a duplicate."
 )
 
 # ---------------------------------------------------------------- sidebar filters (apply to both data tabs)
@@ -280,7 +282,7 @@ duplicate group is counted.
         """
     )
 
-    st.markdown("#### The three definitions of a duplicate")
+    st.markdown("#### The five definitions of a duplicate")
     st.markdown(
         """
 Each definition changes which columns must match for two alerts to be considered the same:
@@ -290,9 +292,15 @@ Each definition changes which columns must match for two alerts to be considered
 | **Same URL** | the same `url` |
 | **Same URL + post_date** | the same `url` **and** `post_date` |
 | **Same URL + meeting_date** | the same `url` **and** `meeting_date` |
+| **Same meeting_date** | the same `meeting_date` |
+| **Same meeting_date + search_term** | the same `meeting_date` **and** `search_term` |
 
 `post_date` is when the alert was published; `meeting_date` is when the actual
-event occurs.
+event occurs; `search_term` is the keyword that surfaced the alert.
+
+⚠️ **Same meeting_date + search_term** will always show **0 "Dupes between VH & Curate"** (and so
+0 received-first / same-date): Voterheads and Curate draw from **disjoint `search_term` vocabularies**,
+so a cross-source pair can never share one. Only **Dupes within source** is meaningful for that definition.
         """
     )
 
