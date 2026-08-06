@@ -2,13 +2,15 @@
 Alert source-overlap visualization app.
 
 Run with:
-    streamlit run overlap_app.py
+    streamlit run app.py
 
-Reads sheets/overlap_results.csv, which is exported by the
-alerts_source_overlap.ipynb notebook (the "Export ... for the visualization app" cell).
+Reads data/overlap_results.csv (the rolled-up county/state/source table exported by the
+alerts_source_overlap.ipynb notebook) and data/alerts.csv (the un-rolled-up alert rows).
 """
 import inspect
 import os
+from collections import Counter
+
 import pandas as pd
 import altair as alt
 import streamlit as st
@@ -30,7 +32,9 @@ def render_dataframe(df, **kwargs):
         kwargs.setdefault("lazy", False)
     st.dataframe(df, **kwargs)
 
+
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "overlap_results.csv")
+ALERTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "alerts.csv")
 
 # the base integer count columns -> friendly labels used in selectors / axis titles
 METRICS = {
@@ -71,6 +75,34 @@ DEFINITION_ORDER = [
     "Same meeting_date + search_term",
 ]
 
+# metrics that describe cross-source overlap; clicking a bar ranked by one of these keeps BOTH
+# sources in the Raw Alerts Viewer so the between-source duplicate pairs stay visible/highlightable
+BETWEEN_SOURCE_METRICS = {"dupes_between_vh_curate", PCT_COL}
+
+# Maps each definition to the raw-alert columns that make two alerts "the same". Duplicate
+# detection is always scoped within a county/state, so these are the *additional* key columns.
+# Used to highlight duplicate sets in the raw alerts viewer.
+DEFINITION_KEYS = {
+    "Same URL": ["url"],
+    "Same URL + post_date": ["url", "post_date"],
+    "Same URL + meeting_date": ["url", "meeting_date"],
+    "Same meeting_date": ["meeting_date"],
+    "Same meeting_date + search_term": ["meeting_date", "search_term"],
+    "Same post_date + milestone_type": ["post_date", "milestone_type"],
+    "Same meeting_date + milestone_type": ["meeting_date", "milestone_type"],
+}
+
+# two visually-distinct blues for alternating duplicate sets; dark text keeps contrast in both themes
+DUPE_COLORS = ["#cfe3ff", "#8fbce8"]
+DUPE_TEXT = "#0a2a43"
+DUPE_HIGHLIGHT_CAP = 3000  # skip per-row styling above this many rows to keep the browser snappy
+
+# columns shown (in this order) in the raw alerts viewer
+RAW_DISPLAY_COLS = ["source", "county", "state", "post_date", "meeting_date",
+                    "milestone_type", "search_term", "url"]
+
+VIEWS = ["Overview", "Data tables", "Bar chart", "Raw Alerts Viewer", "About the metrics"]
+
 
 @st.cache_data
 def load_data(path, mtime):
@@ -86,6 +118,16 @@ def load_data(path, mtime):
     return df
 
 
+@st.cache_data
+def load_alerts(path, mtime):
+    df = pd.read_csv(path)
+    df = df.drop(columns=[c for c in df.columns if c.startswith("Unnamed")], errors="ignore")
+    # align the source column name with the rolled-up table + sidebar filters
+    if "milestone_source" in df.columns:
+        df = df.rename(columns={"milestone_source": "source"})
+    return df
+
+
 def apply_filters(df, states, counties, sources):
     """Empty selection means 'no filter on this field'."""
     if states:
@@ -97,10 +139,78 @@ def apply_filters(df, states, counties, sources):
     return df
 
 
+def dupe_group_ordinals(view, key_cols):
+    """Positional list aligned to view's rows: the duplicate-set ordinal (0, 1, 2, … in the order
+    sets first appear) for rows that belong to a dupe group, else -1. A dupe group is >=2 rows
+    that share (county, state, *key_cols*); rows with a null in any key column are never grouped."""
+    grp_cols = ["county", "state"] + [c for c in key_cols if c in view.columns]
+    present = view[grp_cols].notna().all(axis=1).tolist()
+    keys = [tuple(r) for r in view[grp_cols].to_numpy()]
+    counts = Counter(k for k, p in zip(keys, present) if p)
+    seen, nxt, out = {}, 0, []
+    for k, p in zip(keys, present):
+        if p and counts[k] >= 2:
+            if k not in seen:
+                seen[k] = nxt
+                nxt += 1
+            out.append(seen[k])
+        else:
+            out.append(-1)
+    return out
+
+
+def style_alerts(view, key_cols):
+    """Return a pandas Styler that shades each duplicate set, alternating between two blues."""
+    ordinals = dupe_group_ordinals(view, key_cols)
+
+    def _row_style(row):
+        gid = ordinals[row.name]  # row.name is the positional index (view is reset-indexed)
+        if gid < 0:
+            return [""] * len(row)
+        return [f"background-color: {DUPE_COLORS[gid % 2]}; color: {DUPE_TEXT}"] * len(row)
+
+    return view.style.apply(_row_style, axis=1)
+
+
+def _extract_points(sel):
+    """Pull the list of selected point-dicts out of a Streamlit altair selection payload,
+    tolerating both dict-like and attribute-style objects and any selection-param name."""
+    if not sel:
+        return []
+    selection = None
+    if isinstance(sel, dict):
+        selection = sel.get("selection", sel)
+    else:
+        selection = getattr(sel, "selection", None)
+    if isinstance(selection, dict):
+        for value in selection.values():
+            if isinstance(value, list) and value:
+                return value
+    return []
+
+
+def _handle_chart_click():
+    """Chart on_select callback: focus the raw viewer on the clicked bar and switch to it."""
+    points = _extract_points(st.session_state.get("chart_select"))
+    if not points:
+        return
+    p = points[0]
+    # When ranking by a cross-source metric, keep BOTH sources in the viewer so the between-source
+    # duplicate pairs remain visible/highlightable — don't pin the focus to the bar's own source.
+    metric = st.session_state.get("chart_metric")
+    source = None if metric in BETWEEN_SOURCE_METRICS else p.get("source")
+    st.session_state.raw_focus = {
+        "county": p.get("county"), "state": p.get("state"), "source": source,
+    }
+    # the duplicate definition is shared across views (key "dupe_def"), so the viewer already
+    # highlights by whatever was selected on the chart — nothing extra to carry over.
+    st.session_state.active_view = "Raw Alerts Viewer"
+
+
 # ---------------------------------------------------------------- load
 if not os.path.exists(DATA_PATH):
     st.error(
-        "Could not find `sheets/overlap_results.csv`.\n\n"
+        "Could not find `data/overlap_results.csv`.\n\n"
         "Run the **alerts_source_overlap.ipynb** notebook top-to-bottom first — the "
         "export cell writes this file."
     )
@@ -111,13 +221,15 @@ data = load_data(DATA_PATH, os.path.getmtime(DATA_PATH))
 data = data[data["definition"].isin(DEFINITION_ORDER)].copy()
 definitions = [d for d in DEFINITION_ORDER if d in data["definition"].unique()]
 
+alerts = load_alerts(ALERTS_PATH, os.path.getmtime(ALERTS_PATH)) if os.path.exists(ALERTS_PATH) else None
+
 st.title("Alert Source Overlap Explorer")
 st.caption(
     "Duplicate alerts between and within Voterheads & Curate, at the county/state/source level, "
     "under five different definitions of a duplicate."
 )
 
-# ---------------------------------------------------------------- sidebar filters (apply to both data tabs)
+# ---------------------------------------------------------------- sidebar filters (apply to every view)
 st.sidebar.header("Filters")
 st.sidebar.caption("Applied to every tab. Leave a filter empty to include everything.")
 
@@ -138,15 +250,26 @@ st.sidebar.caption(f"streamlit {st.__version__} · dataframe lazy-load: "
 
 filtered = apply_filters(data, sel_states, sel_counties, sel_sources)
 
-tab_overview, tab_tables, tab_chart, tab_about = st.tabs(
-    ["Overview", "Data tables", "Bar chart", "About the metrics"])
+# Keep the shared duplicate definition alive across views. The Data tables view renders no
+# "dupe_def" selectbox, so without re-touching the key each run Streamlit garbage-collects the
+# widget value on that run and it reverts to the default. Re-assigning marks it as user state.
+if "dupe_def" in st.session_state:
+    st.session_state.dupe_def = st.session_state.dupe_def
 
-# ================================================================ Tab 0: overview
-with tab_overview:
+# ---------------------------------------------------------------- navigation (radio acts as the tab
+# bar; unlike st.tabs it can be switched programmatically — e.g. from a bar click)
+if "active_view" not in st.session_state:
+    st.session_state.active_view = VIEWS[0]
+active_view = st.radio("View", VIEWS, key="active_view", horizontal=True, label_visibility="collapsed")
+st.divider()
+
+# ================================================================ Overview
+if active_view == "Overview":
     st.subheader("At-a-glance overview")
     ov_def = st.selectbox(
-        "Duplicate definition", definitions, key="ov_def",
-        help="Duplicate counts depend on the definition — the totals below use this one.",
+        "Duplicate definition", definitions, key="dupe_def",
+        help="Duplicate counts depend on the definition — the totals below use this one. "
+             "Your choice carries across all tabs.",
     )
     ov = filtered[filtered["definition"] == ov_def]
 
@@ -185,8 +308,8 @@ with tab_overview:
     r3a.metric("Dupes within Voterheads", f"{vh_within:,}")
     r3b.metric("Dupes within Curate", f"{cu_within:,}")
 
-# ================================================================ Tab 1: data tables
-with tab_tables:
+# ================================================================ Data tables
+elif active_view == "Data tables":
     st.subheader("Base data tables")
     st.caption("One table per duplicate definition. Click a column header to sort. Filters from the sidebar apply.")
 
@@ -203,12 +326,12 @@ with tab_tables:
         with st.expander(f"{defn}  —  {len(sub):,} rows", expanded=(i == 0)):
             render_dataframe(sub, width="stretch", hide_index=True, height=360, column_config=pct_config)
 
-# ================================================================ Tab 2: bar chart
-with tab_chart:
+# ================================================================ Bar chart
+elif active_view == "Bar chart":
     st.subheader("Ranked counties")
 
     c1, c2, c3 = st.columns([2, 2, 1])
-    sel_def = c1.selectbox("Duplicate definition", definitions, key="chart_def")
+    sel_def = c1.selectbox("Duplicate definition", definitions, key="dupe_def")
     metric = c2.selectbox(
         "Rank by", list(RANKABLE), format_func=lambda c: RANKABLE[c], key="chart_metric",
     )
@@ -239,7 +362,11 @@ with tab_chart:
         )
         rows = chart_df.sort_values(metric, ascending=ascending).head(n_rows)
         st.markdown(f"**{'Bottom' if ascending else 'Top'} {len(rows)} by {RANKABLE[metric]}**")
+        if alerts is not None:
+            st.caption("Tip: click a bar to open its underlying alerts in the Raw Alerts Viewer.")
 
+        click_sel = alt.selection_point(fields=["county", "state", "source"],
+                                        on="click", name="barsel", empty=False)
         chart = (
             alt.Chart(rows)
             .mark_bar()
@@ -255,9 +382,10 @@ with tab_chart:
                     alt.Tooltip(f"{PCT_COL}:Q", title=PCT_LABEL, format=".1f"),
                 ],
             )
+            .add_params(click_sel)
             .properties(height=max(300, 26 * len(rows)))
         )
-        st.altair_chart(chart, width="stretch")
+        st.altair_chart(chart, width="stretch", on_select=_handle_chart_click, key="chart_select")
 
         with st.expander(f"Show these {len(rows)} rows as a table"):
             render_dataframe(
@@ -268,8 +396,56 @@ with tab_chart:
                 column_config={PCT_COL: st.column_config.NumberColumn(PCT_LABEL, format="%.1f%%")},
             )
 
-# ================================================================ Tab 3: about
-with tab_about:
+# ================================================================ Raw Alerts Viewer
+elif active_view == "Raw Alerts Viewer":
+    st.subheader("Raw alerts viewer")
+    if alerts is None:
+        st.error("Could not find `data/alerts.csv`.")
+    else:
+        raw_def = st.selectbox(
+            "Highlight duplicates by", definitions, key="dupe_def",
+            help="Rows that form a duplicate set under this definition are shaded; adjacent sets "
+                 "alternate between two blues so you can tell neighbouring pairs apart. "
+                 "Your choice carries across all tabs.",
+        )
+        key_cols = DEFINITION_KEYS.get(raw_def, [])
+
+        focus = st.session_state.get("raw_focus")
+        if focus and any(v is not None for v in focus.values()):
+            chip = ", ".join(str(focus[k]) for k in ("county", "state", "source") if focus.get(k) is not None)
+            fc1, fc2 = st.columns([5, 1])
+            fc1.info(f"Focused on **{chip}** (from a bar click). Sidebar filters are ignored while focused.")
+            if fc2.button("Clear focus"):
+                st.session_state.raw_focus = None
+                st.rerun()
+            view = alerts
+            for col in ("county", "state", "source"):
+                if focus.get(col) is not None:
+                    view = view[view[col] == focus[col]]
+        else:
+            view = apply_filters(alerts, sel_states, sel_counties, sel_sources)
+
+        # default order groups duplicate sets together so pairs sit next to each other
+        sort_cols = [c for c in (["county", "state"] + key_cols) if c in view.columns]
+        view = view.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+        view = view[[c for c in RAW_DISPLAY_COLS if c in view.columns]]
+
+        n_dupes = sum(1 for g in dupe_group_ordinals(view, key_cols) if g >= 0) if len(view) else 0
+        st.caption(f"{len(view):,} alerts · {n_dupes:,} in a duplicate set under **{raw_def}** "
+                   "(shaded; click a header to sort)")
+
+        if len(view) == 0:
+            st.info("No alerts match the current filters.")
+        elif len(view) <= DUPE_HIGHLIGHT_CAP:
+            st.dataframe(style_alerts(view, key_cols), width="stretch", hide_index=True)
+        else:
+            st.warning(f"Showing {len(view):,} rows — duplicate highlighting is turned off above "
+                       f"{DUPE_HIGHLIGHT_CAP:,} rows to stay responsive. Apply filters, or click a "
+                       "bar on the Bar chart tab, to narrow the view and enable highlighting.")
+            render_dataframe(view, width="stretch", hide_index=True)
+
+# ================================================================ About
+elif active_view == "About the metrics":
     st.subheader("What the definitions and metrics mean")
 
     st.markdown(
@@ -316,6 +492,17 @@ so a cross-source pair can never share one. Only **Dupes within source** is mean
 | **dupe_alerts_received_same_date** | Cross-source duplicate events where **both providers posted on the same `post_date`**. Counted on *both* the Voterheads and Curate rows, so the value matches across the two. |
 | **dupes_within_source** | Alerts whose dupe-key repeats **within this row's own source** — repeated alerts from the same provider. (The grain is county/state/source, so the source is the row itself; on a Voterheads row it counts within-Voterheads repeats, on a Curate row within-Curate.) |
         """
+    )
+
+    st.markdown("#### The Raw Alerts Viewer")
+    st.markdown(
+        """
+The **Raw Alerts Viewer** shows the un-rolled-up alert rows behind the metrics. It responds to the
+sidebar filters, and **clicking a bar** on the Bar chart tab jumps here focused on that
+county/state/source. Rows that form a **duplicate set** under the chosen definition are shaded, with
+neighbouring sets alternating between two shades of blue. Highlighting is disabled above
+%d rows for responsiveness — narrow the view (via filters or a bar click) to re-enable it.
+        """ % DUPE_HIGHLIGHT_CAP
     )
 
     st.markdown("#### Notes & caveats")
