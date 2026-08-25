@@ -88,8 +88,6 @@ DEFINITION_KEYS = {
     "Same URL + meeting_date": ["url", "meeting_date"],
     "Same meeting_date": ["meeting_date"],
     "Same meeting_date + search_term": ["meeting_date", "search_term"],
-    "Same post_date + milestone_type": ["post_date", "milestone_type"],
-    "Same meeting_date + milestone_type": ["meeting_date", "milestone_type"],
 }
 
 # two visually-distinct blues for alternating duplicate sets; dark text keeps contrast in both themes
@@ -223,6 +221,14 @@ definitions = [d for d in DEFINITION_ORDER if d in data["definition"].unique()]
 
 alerts = load_alerts(ALERTS_PATH, os.path.getmtime(ALERTS_PATH)) if os.path.exists(ALERTS_PATH) else None
 
+# date range of the underlying alerts (min/max post_date), surfaced on the Overview + About tabs
+DATE_RANGE_TEXT = None
+if alerts is not None and "post_date" in alerts.columns:
+    _post_dates = pd.to_datetime(alerts["post_date"], errors="coerce")
+    _dmin, _dmax = _post_dates.min(), _post_dates.max()
+    if pd.notna(_dmin) and pd.notna(_dmax):
+        DATE_RANGE_TEXT = f"{_dmin:%B} {_dmin.day}, {_dmin.year} to {_dmax:%B} {_dmax.day}, {_dmax.year}"
+
 st.title("Alert Source Overlap Explorer")
 st.caption(
     "Duplicate alerts between and within Voterheads & Curate, at the county/state/source level, "
@@ -244,10 +250,6 @@ sel_counties = st.sidebar.multiselect("County", county_opts)
 source_opts = sorted(data["source"].dropna().unique())
 sel_sources = st.sidebar.multiselect("Source", source_opts)
 
-# tiny build indicator — confirms which Streamlit the deploy is actually running (safe to remove)
-st.sidebar.caption(f"streamlit {st.__version__} · dataframe lazy-load: "
-                   f"{'off' if _DATAFRAME_HAS_LAZY else 'n/a'}")
-
 filtered = apply_filters(data, sel_states, sel_counties, sel_sources)
 
 # Keep the shared duplicate definition alive across views. The Data tables view renders no
@@ -265,6 +267,8 @@ st.divider()
 
 # ================================================================ Overview
 if active_view == "Overview":
+    if DATE_RANGE_TEXT:
+        st.markdown(f"**Date range of data:** {DATE_RANGE_TEXT}")
     st.subheader("At-a-glance overview")
     ov_def = st.selectbox(
         "Duplicate definition", definitions, key="dupe_def",
@@ -447,6 +451,8 @@ elif active_view == "Raw Alerts Viewer":
 # ================================================================ About
 elif active_view == "About the metrics":
     st.subheader("What the definitions and metrics mean")
+    if DATE_RANGE_TEXT:
+        st.markdown(f"**Date range of data:** {DATE_RANGE_TEXT}")
 
     st.markdown(
         """
