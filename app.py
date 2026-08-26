@@ -121,6 +121,32 @@ def load_alerts(path, mtime):
     return df
 
 
+@st.cache_data
+def first_event_deltas(path, mtime, key_cols):
+    """For each cross-source duplicate event under a definition, which provider posted first and by
+    how many days. Mirrors the notebook's who-was-first logic: within each county/state + dupe-key
+    group where BOTH providers appear, compare each provider's earliest post_date. Returns one row
+    per event with columns county, state, winner ('Voterheads'/'Curate'/'tie'), delta_days."""
+    df = load_alerts(path, mtime).copy()
+    df["_pd"] = pd.to_datetime(df["post_date"], errors="coerce")
+    grp = ["county", "state"] + list(key_cols)
+    firsts = (df.dropna(subset=grp + ["_pd"])
+                .groupby(grp + ["source"])["_pd"].min()
+                .unstack("source"))
+    for s in ("Voterheads", "Curate"):
+        if s not in firsts.columns:
+            firsts[s] = pd.NaT
+    firsts = firsts.dropna(subset=["Voterheads", "Curate"]).reset_index()  # both providers present
+    if firsts.empty:
+        return pd.DataFrame(columns=["county", "state", "winner", "delta_days"])
+    vh, cu = firsts["Voterheads"], firsts["Curate"]
+    firsts["winner"] = "tie"
+    firsts.loc[vh < cu, "winner"] = "Voterheads"
+    firsts.loc[cu < vh, "winner"] = "Curate"
+    firsts["delta_days"] = (vh - cu).abs().dt.total_seconds() / 86400.0
+    return firsts[["county", "state", "winner", "delta_days"]]
+
+
 def apply_filters(df, states, counties, sources):
     """Empty selection means 'no filter on this field'."""
     if states:
@@ -216,11 +242,20 @@ alerts = load_alerts(ALERTS_PATH, os.path.getmtime(ALERTS_PATH)) if os.path.exis
 
 # date range of the underlying alerts (min/max post_date), surfaced on the Overview + About tabs
 DATE_RANGE_TEXT = None
+DATE_RANGE_MD = None
 if alerts is not None and "post_date" in alerts.columns:
     _post_dates = pd.to_datetime(alerts["post_date"], errors="coerce")
     _dmin, _dmax = _post_dates.min(), _post_dates.max()
     if pd.notna(_dmin) and pd.notna(_dmax):
         DATE_RANGE_TEXT = f"{_dmin:%B} {_dmin.day}, {_dmin.year} to {_dmax:%B} {_dmax.day}, {_dmax.year}"
+        # rendered larger than body text for visibility (used on both the Overview and About tabs)
+        DATE_RANGE_MD = ("<p style='font-size:1.35rem; margin:0.15rem 0 0.6rem;'>"
+                         f"<strong>Date range of data:</strong> {DATE_RANGE_TEXT}</p>")
+
+# dataset-level alert counts (whole alerts.csv, independent of filters/definition) — top of Overview
+ALERTS_TOTAL = len(alerts) if alerts is not None else 0
+ALERTS_CURATE = int((alerts["source"] == "Curate").sum()) if alerts is not None else 0
+ALERTS_VOTERHEADS = int((alerts["source"] == "Voterheads").sum()) if alerts is not None else 0
 
 st.title("Alert Source Overlap Explorer")
 st.caption(
@@ -260,9 +295,17 @@ st.divider()
 
 # ================================================================ Overview
 if active_view == "Overview":
-    if DATE_RANGE_TEXT:
-        st.markdown(f"**Date range of data:** {DATE_RANGE_TEXT}")
+    if DATE_RANGE_MD:
+        st.markdown(DATE_RANGE_MD, unsafe_allow_html=True)
     st.subheader("At-a-glance overview")
+
+    # dataset-level alert totals (whole alerts.csv, not affected by the definition or sidebar filters)
+    if alerts is not None:
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Total alerts", f"{ALERTS_TOTAL:,}")
+        a2.metric("Curate alerts", f"{ALERTS_CURATE:,}")
+        a3.metric("Voterheads alerts", f"{ALERTS_VOTERHEADS:,}")
+
     ov_def = st.selectbox(
         "Duplicate definition", definitions, key="dupe_def",
         help="Duplicate counts depend on the definition — the totals below use this one. "
@@ -295,10 +338,39 @@ if active_view == "Overview":
              "(dupes_between_vh_curate) or within a source (dupes_within_source) — under this definition.",
     )
 
+    # average lead time: among events a provider won, how many days ahead of the other it posted.
+    # Uses the raw alerts (post-date deltas aren't in the rolled-up table); scoped to the selected
+    # definition + the geographic filters (the comparison is inherently cross-source, so the sidebar
+    # Source filter isn't applied here).
+    vh_lead = cu_lead = None
+    if alerts is not None:
+        events = first_event_deltas(ALERTS_PATH, os.path.getmtime(ALERTS_PATH),
+                                    tuple(DEFINITION_KEYS.get(ov_def, [])))
+        if sel_states:
+            events = events[events["state"].isin(sel_states)]
+        if sel_counties:
+            events = events[events["county"].isin(sel_counties)]
+        vh_ev = events.loc[events["winner"] == "Voterheads", "delta_days"]
+        cu_ev = events.loc[events["winner"] == "Curate", "delta_days"]
+        vh_lead = vh_ev.mean() if len(vh_ev) else None
+        cu_lead = cu_ev.mean() if len(cu_ev) else None
+
     st.markdown("**Cross-source alerts received first** — who posted earlier when both providers caught the same event")
     r2a, r2b = st.columns(2)
     r2a.metric("Voterheads received first", f"{vh_first:,}")
+    if vh_lead is not None:
+        r2a.markdown(
+            f"<span style='font-size:1.05rem; color:#4a90e2;'>"
+            f"avg <u>{vh_lead:.1f} days earlier than Curate</u></span>",
+            unsafe_allow_html=True,
+        )
     r2b.metric("Curate received first", f"{cu_first:,}")
+    if cu_lead is not None:
+        r2b.markdown(
+            f"<span style='font-size:1.05rem; color:#4a90e2;'>"
+            f"avg <u>{cu_lead:.1f} days earlier than Voterheads</u></span>",
+            unsafe_allow_html=True,
+        )
 
     st.markdown("**Duplicates within a single source** — repeated alerts from the same provider")
     r3a, r3b = st.columns(2)
@@ -414,6 +486,11 @@ elif active_view == "Raw Alerts Viewer":
                  "Your choice carries across all tabs.",
         )
         key_cols = DEFINITION_KEYS.get(raw_def, [])
+        dupes_only = st.toggle(
+            "Show only duplicates", key="raw_dupes_only",
+            help="Filter the table to just the rows that belong to a duplicate set under the "
+                 "selected definition — the shaded rows.",
+        )
 
         focus = st.session_state.get("raw_focus")
         if focus and any(v is not None for v in focus.values()):
@@ -435,12 +512,20 @@ elif active_view == "Raw Alerts Viewer":
         view = view.sort_values(sort_cols, na_position="last").reset_index(drop=True)
         view = view[[c for c in RAW_DISPLAY_COLS if c in view.columns]]
 
-        n_dupes = sum(1 for g in dupe_group_ordinals(view, key_cols) if g >= 0) if len(view) else 0
-        st.caption(f"{len(view):,} alerts · {n_dupes:,} in a duplicate set under **{raw_def}** "
-                   "(shaded; click a header to sort)")
+        ordinals = dupe_group_ordinals(view, key_cols) if len(view) else []
+        is_dupe = pd.Series([g >= 0 for g in ordinals], index=view.index, dtype=bool)
+        n_total, n_dupes = len(view), int(is_dupe.sum())
+        if dupes_only:
+            view = view[is_dupe].reset_index(drop=True)
+            st.caption(f"Showing {len(view):,} duplicate alerts (of {n_total:,}) under "
+                       f"**{raw_def}** (shaded; click a header to sort)")
+        else:
+            st.caption(f"{n_total:,} alerts · {n_dupes:,} in a duplicate set under **{raw_def}** "
+                       "(shaded; click a header to sort)")
 
         if len(view) == 0:
-            st.info("No alerts match the current filters.")
+            st.info("No duplicate alerts under this definition match the current filters." if dupes_only
+                    else "No alerts match the current filters.")
         elif len(view) <= DUPE_HIGHLIGHT_CAP:
             st.dataframe(style_alerts(view, key_cols), width="stretch", hide_index=True)
         else:
@@ -452,8 +537,8 @@ elif active_view == "Raw Alerts Viewer":
 # ================================================================ About
 elif active_view == "About the metrics":
     st.subheader("What the definitions and metrics mean")
-    if DATE_RANGE_TEXT:
-        st.markdown(f"**Date range of data:** {DATE_RANGE_TEXT}")
+    if DATE_RANGE_MD:
+        st.markdown(DATE_RANGE_MD, unsafe_allow_html=True)
 
     st.markdown(
         """
