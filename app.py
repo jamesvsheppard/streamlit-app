@@ -57,14 +57,13 @@ FIRST_COLS = {
 INT_COLS = list(METRICS) + list(FIRST_COLS)
 COUNT_LABELS = {**METRICS, **FIRST_COLS}
 
-# everything rankable in the chart, in display order: counts + share %
-RANKABLE = {
+# metrics a source-stacked bar can show: each splits additively across VH/Curate. (The share %
+# is a ratio, and received_same_date is identical on both source rows, so neither stacks meaningfully.)
+STACK_METRICS = {
     "total_alerts": "Total alerts",
     "dupes_between_vh_curate": "Dupes between VH & Curate",
-    PCT_COL: PCT_LABEL,
-    "dupe_alerts_received_first": "Dupe alerts received first",
-    "dupe_alerts_received_same_date": "Dupe alerts received same date",
     "dupes_within_source": "Dupes within source",
+    "dupe_alerts_received_first": "Dupe alerts received first",
 }
 
 DEFINITION_ORDER = [
@@ -74,10 +73,6 @@ DEFINITION_ORDER = [
     "Same meeting_date",
     "Same meeting_date + search_term",
 ]
-
-# metrics that describe cross-source overlap; clicking a bar ranked by one of these keeps BOTH
-# sources in the Raw Alerts Viewer so the between-source duplicate pairs stay visible/highlightable
-BETWEEN_SOURCE_METRICS = {"dupes_between_vh_curate", PCT_COL}
 
 # Maps each definition to the raw-alert columns that make two alerts "the same". Duplicate
 # detection is always scoped within a county/state, so these are the *additional* key columns.
@@ -188,17 +183,15 @@ def _extract_points(sel):
 
 
 def _handle_chart_click():
-    """Chart on_select callback: focus the raw viewer on the clicked bar and switch to it."""
+    """Chart on_select callback: focus the raw viewer on the clicked jurisdiction and switch to it."""
     points = _extract_points(st.session_state.get("chart_select"))
     if not points:
         return
     p = points[0]
-    # When ranking by a cross-source metric, keep BOTH sources in the viewer so the between-source
-    # duplicate pairs remain visible/highlightable — don't pin the focus to the bar's own source.
-    metric = st.session_state.get("chart_metric")
-    source = None if metric in BETWEEN_SOURCE_METRICS else p.get("source")
+    # Each bar is a whole jurisdiction (both sources stacked), so focus on county/state and keep
+    # both providers — this also lets the viewer highlight the between-source duplicate pairs.
     st.session_state.raw_focus = {
-        "county": p.get("county"), "state": p.get("state"), "source": source,
+        "county": p.get("county"), "state": p.get("state"), "source": None,
     }
     # the duplicate definition is shared across views (key "dupe_def"), so the viewer already
     # highlights by whatever was selected on the chart — nothing extra to carry over.
@@ -332,17 +325,16 @@ elif active_view == "Data tables":
 
 # ================================================================ Bar chart
 elif active_view == "Bar chart":
-    st.subheader("Ranked counties")
+    st.subheader("Ranked jurisdictions")
 
     c1, c2, c3 = st.columns([2, 2, 1])
     sel_def = c1.selectbox("Duplicate definition", definitions, key="dupe_def")
     metric = c2.selectbox(
-        "Rank by", list(RANKABLE), format_func=lambda c: RANKABLE[c], key="chart_metric",
+        "Rank by", list(STACK_METRICS), format_func=lambda c: STACK_METRICS[c], key="chart_metric",
     )
     min_total = c3.number_input(
         "Min. total alerts", min_value=1, value=1, step=1, key="chart_min_total",
-        help="Ignore counties with fewer than this many alerts. Useful when ranking by "
-             "share % so low-volume counties sitting at 100% don't dominate the ranking.",
+        help="Ignore jurisdictions whose combined (Voterheads + Curate) alert count is below this.",
     )
 
     c4, c5 = st.columns([2, 2])
@@ -353,52 +345,61 @@ elif active_view == "Bar chart":
     n_rows = c5.slider("Rows to show", min_value=5, max_value=50, value=20, step=5, key="chart_rows")
     ascending = order.startswith("Bottom")
 
-    chart_df = filtered[(filtered["definition"] == sel_def)
-                        & (filtered["total_alerts"] >= min_total)].copy()
+    metric_label = STACK_METRICS[metric]
+    chart_df = filtered[filtered["definition"] == sel_def].copy()
+    chart_df["jurisdiction"] = (chart_df["county"].fillna("(no county)")
+                                + ", " + chart_df["state"].astype(str))
 
-    if chart_df.empty:
-        st.info("No rows match the current filters.")
+    # roll the two source rows up to the jurisdiction to rank and apply the min-alerts filter
+    juris = chart_df.groupby(["county", "state", "jurisdiction"], as_index=False).agg(
+        metric_total=(metric, "sum"),
+        alerts_total=("total_alerts", "sum"),
+    )
+    juris = juris[juris["alerts_total"] >= min_total]
+    juris = juris.sort_values("metric_total", ascending=ascending).head(n_rows)
+
+    if juris.empty:
+        st.info("No jurisdictions match the current filters.")
     else:
-        chart_df["label"] = (
-            chart_df["county"].fillna("(no county)")
-            + ", " + chart_df["state"].astype(str)
-            + " (" + chart_df["source"] + ")"
-        )
-        rows = chart_df.sort_values(metric, ascending=ascending).head(n_rows)
-        st.markdown(f"**{'Bottom' if ascending else 'Top'} {len(rows)} by {RANKABLE[metric]}**")
-        if alerts is not None:
-            st.caption("Tip: click a bar to open its underlying alerts in the Raw Alerts Viewer.")
+        # per-source rows for the selected jurisdictions -> the stacked segments (+ jurisdiction total)
+        plot = chart_df.merge(juris[["county", "state", "metric_total"]], on=["county", "state"])
+        order_list = juris["jurisdiction"].tolist()  # largest-first (top) or smallest-first (bottom)
 
-        click_sel = alt.selection_point(fields=["county", "state", "source"],
-                                        on="click", name="barsel", empty=False)
+        st.markdown(f"**{'Bottom' if ascending else 'Top'} {len(juris)} jurisdictions by {metric_label}** "
+                    "— each bar stacks Voterheads + Curate")
+        if alerts is not None:
+            st.caption("Tip: click a bar to open that jurisdiction's underlying alerts in the Raw Alerts Viewer.")
+
+        click_sel = alt.selection_point(fields=["county", "state"], on="click", name="barsel", empty=False)
         chart = (
-            alt.Chart(rows)
+            alt.Chart(plot)
             .mark_bar()
             .encode(
-                x=alt.X(f"{metric}:Q", title=RANKABLE[metric]),
-                y=alt.Y("label:N", sort=("x" if ascending else "-x"), title=None),
+                x=alt.X(f"{metric}:Q", title=metric_label, stack="zero"),
+                y=alt.Y("jurisdiction:N", sort=order_list, title=None),
                 color=alt.Color("source:N", title="Source"),
                 tooltip=[
-                    alt.Tooltip("county:N"),
-                    alt.Tooltip("state:N"),
-                    alt.Tooltip("source:N"),
-                    *[alt.Tooltip(f"{c}:Q", title=lbl) for c, lbl in COUNT_LABELS.items()],
-                    alt.Tooltip(f"{PCT_COL}:Q", title=PCT_LABEL, format=".1f"),
+                    alt.Tooltip("jurisdiction:N", title="Jurisdiction"),
+                    alt.Tooltip("source:N", title="Source"),
+                    alt.Tooltip(f"{metric}:Q", title=metric_label),
+                    alt.Tooltip("metric_total:Q", title=f"{metric_label} (total)"),
                 ],
             )
             .add_params(click_sel)
-            .properties(height=max(300, 26 * len(rows)))
+            .properties(height=max(300, 30 * len(juris)))
         )
         st.altair_chart(chart, width="stretch", on_select=_handle_chart_click, key="chart_select")
 
-        with st.expander(f"Show these {len(rows)} rows as a table"):
-            render_dataframe(
-                rows[["county", "state", "source", "total_alerts", "dupes_between_vh_curate",
-                      PCT_COL, "dupe_alerts_received_first", "dupe_alerts_received_same_date",
-                      "dupes_within_source"]],
-                width="stretch", hide_index=True,
-                column_config={PCT_COL: st.column_config.NumberColumn(PCT_LABEL, format="%.1f%%")},
-            )
+        with st.expander(f"Show these {len(juris)} jurisdictions as a table"):
+            pv = (plot.pivot_table(index=["county", "state"], columns="source",
+                                   values=metric, fill_value=0, aggfunc="sum").reset_index())
+            for s in ("Voterheads", "Curate"):
+                if s not in pv.columns:
+                    pv[s] = 0
+            pv["Total"] = pv["Voterheads"] + pv["Curate"]
+            pv = pv.sort_values("Total", ascending=ascending).rename(columns={
+                "Voterheads": f"{metric_label} — VH", "Curate": f"{metric_label} — Curate"})
+            render_dataframe(pv, width="stretch", hide_index=True)
 
 # ================================================================ Raw Alerts Viewer
 elif active_view == "Raw Alerts Viewer":
