@@ -57,14 +57,13 @@ FIRST_COLS = {
 INT_COLS = list(METRICS) + list(FIRST_COLS)
 COUNT_LABELS = {**METRICS, **FIRST_COLS}
 
-# everything rankable in the chart, in display order: counts + share %
-RANKABLE = {
+# metrics a source-stacked bar can show: each splits additively across VH/Curate. (The share %
+# is a ratio, and received_same_date is identical on both source rows, so neither stacks meaningfully.)
+STACK_METRICS = {
     "total_alerts": "Total alerts",
     "dupes_between_vh_curate": "Dupes between VH & Curate",
-    PCT_COL: PCT_LABEL,
-    "dupe_alerts_received_first": "Dupe alerts received first",
-    "dupe_alerts_received_same_date": "Dupe alerts received same date",
     "dupes_within_source": "Dupes within source",
+    "dupe_alerts_received_first": "Dupe alerts received first",
 }
 
 DEFINITION_ORDER = [
@@ -75,10 +74,6 @@ DEFINITION_ORDER = [
     "Same meeting_date + search_term",
 ]
 
-# metrics that describe cross-source overlap; clicking a bar ranked by one of these keeps BOTH
-# sources in the Raw Alerts Viewer so the between-source duplicate pairs stay visible/highlightable
-BETWEEN_SOURCE_METRICS = {"dupes_between_vh_curate", PCT_COL}
-
 # Maps each definition to the raw-alert columns that make two alerts "the same". Duplicate
 # detection is always scoped within a county/state, so these are the *additional* key columns.
 # Used to highlight duplicate sets in the raw alerts viewer.
@@ -88,8 +83,6 @@ DEFINITION_KEYS = {
     "Same URL + meeting_date": ["url", "meeting_date"],
     "Same meeting_date": ["meeting_date"],
     "Same meeting_date + search_term": ["meeting_date", "search_term"],
-    "Same post_date + milestone_type": ["post_date", "milestone_type"],
-    "Same meeting_date + milestone_type": ["meeting_date", "milestone_type"],
 }
 
 # two visually-distinct blues for alternating duplicate sets; dark text keeps contrast in both themes
@@ -126,6 +119,32 @@ def load_alerts(path, mtime):
     if "milestone_source" in df.columns:
         df = df.rename(columns={"milestone_source": "source"})
     return df
+
+
+@st.cache_data
+def first_event_deltas(path, mtime, key_cols):
+    """For each cross-source duplicate event under a definition, which provider posted first and by
+    how many days. Mirrors the notebook's who-was-first logic: within each county/state + dupe-key
+    group where BOTH providers appear, compare each provider's earliest post_date. Returns one row
+    per event with columns county, state, winner ('Voterheads'/'Curate'/'tie'), delta_days."""
+    df = load_alerts(path, mtime).copy()
+    df["_pd"] = pd.to_datetime(df["post_date"], errors="coerce")
+    grp = ["county", "state"] + list(key_cols)
+    firsts = (df.dropna(subset=grp + ["_pd"])
+                .groupby(grp + ["source"])["_pd"].min()
+                .unstack("source"))
+    for s in ("Voterheads", "Curate"):
+        if s not in firsts.columns:
+            firsts[s] = pd.NaT
+    firsts = firsts.dropna(subset=["Voterheads", "Curate"]).reset_index()  # both providers present
+    if firsts.empty:
+        return pd.DataFrame(columns=["county", "state", "winner", "delta_days"])
+    vh, cu = firsts["Voterheads"], firsts["Curate"]
+    firsts["winner"] = "tie"
+    firsts.loc[vh < cu, "winner"] = "Voterheads"
+    firsts.loc[cu < vh, "winner"] = "Curate"
+    firsts["delta_days"] = (vh - cu).abs().dt.total_seconds() / 86400.0
+    return firsts[["county", "state", "winner", "delta_days"]]
 
 
 def apply_filters(df, states, counties, sources):
@@ -190,17 +209,15 @@ def _extract_points(sel):
 
 
 def _handle_chart_click():
-    """Chart on_select callback: focus the raw viewer on the clicked bar and switch to it."""
+    """Chart on_select callback: focus the raw viewer on the clicked jurisdiction and switch to it."""
     points = _extract_points(st.session_state.get("chart_select"))
     if not points:
         return
     p = points[0]
-    # When ranking by a cross-source metric, keep BOTH sources in the viewer so the between-source
-    # duplicate pairs remain visible/highlightable — don't pin the focus to the bar's own source.
-    metric = st.session_state.get("chart_metric")
-    source = None if metric in BETWEEN_SOURCE_METRICS else p.get("source")
+    # Each bar is a whole jurisdiction (both sources stacked), so focus on county/state and keep
+    # both providers — this also lets the viewer highlight the between-source duplicate pairs.
     st.session_state.raw_focus = {
-        "county": p.get("county"), "state": p.get("state"), "source": source,
+        "county": p.get("county"), "state": p.get("state"), "source": None,
     }
     # the duplicate definition is shared across views (key "dupe_def"), so the viewer already
     # highlights by whatever was selected on the chart — nothing extra to carry over.
@@ -223,6 +240,23 @@ definitions = [d for d in DEFINITION_ORDER if d in data["definition"].unique()]
 
 alerts = load_alerts(ALERTS_PATH, os.path.getmtime(ALERTS_PATH)) if os.path.exists(ALERTS_PATH) else None
 
+# date range of the underlying alerts (min/max post_date), surfaced on the Overview + About tabs
+DATE_RANGE_TEXT = None
+DATE_RANGE_MD = None
+if alerts is not None and "post_date" in alerts.columns:
+    _post_dates = pd.to_datetime(alerts["post_date"], errors="coerce")
+    _dmin, _dmax = _post_dates.min(), _post_dates.max()
+    if pd.notna(_dmin) and pd.notna(_dmax):
+        DATE_RANGE_TEXT = f"{_dmin:%B} {_dmin.day}, {_dmin.year} to {_dmax:%B} {_dmax.day}, {_dmax.year}"
+        # rendered larger than body text for visibility (used on both the Overview and About tabs)
+        DATE_RANGE_MD = ("<p style='font-size:1.35rem; margin:0.15rem 0 0.6rem;'>"
+                         f"<strong>Date range of data:</strong> {DATE_RANGE_TEXT}</p>")
+
+# dataset-level alert counts (whole alerts.csv, independent of filters/definition) — top of Overview
+ALERTS_TOTAL = len(alerts) if alerts is not None else 0
+ALERTS_CURATE = int((alerts["source"] == "Curate").sum()) if alerts is not None else 0
+ALERTS_VOTERHEADS = int((alerts["source"] == "Voterheads").sum()) if alerts is not None else 0
+
 st.title("Alert Source Overlap Explorer")
 st.caption(
     "Duplicate alerts between and within Voterheads & Curate, at the county/state/source level, "
@@ -244,10 +278,6 @@ sel_counties = st.sidebar.multiselect("County", county_opts)
 source_opts = sorted(data["source"].dropna().unique())
 sel_sources = st.sidebar.multiselect("Source", source_opts)
 
-# tiny build indicator — confirms which Streamlit the deploy is actually running (safe to remove)
-st.sidebar.caption(f"streamlit {st.__version__} · dataframe lazy-load: "
-                   f"{'off' if _DATAFRAME_HAS_LAZY else 'n/a'}")
-
 filtered = apply_filters(data, sel_states, sel_counties, sel_sources)
 
 # Keep the shared duplicate definition alive across views. The Data tables view renders no
@@ -265,7 +295,17 @@ st.divider()
 
 # ================================================================ Overview
 if active_view == "Overview":
+    if DATE_RANGE_MD:
+        st.markdown(DATE_RANGE_MD, unsafe_allow_html=True)
     st.subheader("At-a-glance overview")
+
+    # dataset-level alert totals (whole alerts.csv, not affected by the definition or sidebar filters)
+    if alerts is not None:
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Total alerts", f"{ALERTS_TOTAL:,}")
+        a2.metric("Curate alerts", f"{ALERTS_CURATE:,}")
+        a3.metric("Voterheads alerts", f"{ALERTS_VOTERHEADS:,}")
+
     ov_def = st.selectbox(
         "Duplicate definition", definitions, key="dupe_def",
         help="Duplicate counts depend on the definition — the totals below use this one. "
@@ -298,10 +338,39 @@ if active_view == "Overview":
              "(dupes_between_vh_curate) or within a source (dupes_within_source) — under this definition.",
     )
 
+    # average lead time: among events a provider won, how many days ahead of the other it posted.
+    # Uses the raw alerts (post-date deltas aren't in the rolled-up table); scoped to the selected
+    # definition + the geographic filters (the comparison is inherently cross-source, so the sidebar
+    # Source filter isn't applied here).
+    vh_lead = cu_lead = None
+    if alerts is not None:
+        events = first_event_deltas(ALERTS_PATH, os.path.getmtime(ALERTS_PATH),
+                                    tuple(DEFINITION_KEYS.get(ov_def, [])))
+        if sel_states:
+            events = events[events["state"].isin(sel_states)]
+        if sel_counties:
+            events = events[events["county"].isin(sel_counties)]
+        vh_ev = events.loc[events["winner"] == "Voterheads", "delta_days"]
+        cu_ev = events.loc[events["winner"] == "Curate", "delta_days"]
+        vh_lead = vh_ev.mean() if len(vh_ev) else None
+        cu_lead = cu_ev.mean() if len(cu_ev) else None
+
     st.markdown("**Cross-source alerts received first** — who posted earlier when both providers caught the same event")
     r2a, r2b = st.columns(2)
     r2a.metric("Voterheads received first", f"{vh_first:,}")
+    if vh_lead is not None:
+        r2a.markdown(
+            f"<span style='font-size:1.05rem; color:#4a90e2;'>"
+            f"avg <u>{vh_lead:.1f} days earlier than Curate</u></span>",
+            unsafe_allow_html=True,
+        )
     r2b.metric("Curate received first", f"{cu_first:,}")
+    if cu_lead is not None:
+        r2b.markdown(
+            f"<span style='font-size:1.05rem; color:#4a90e2;'>"
+            f"avg <u>{cu_lead:.1f} days earlier than Voterheads</u></span>",
+            unsafe_allow_html=True,
+        )
 
     st.markdown("**Duplicates within a single source** — repeated alerts from the same provider")
     r3a, r3b = st.columns(2)
@@ -328,17 +397,16 @@ elif active_view == "Data tables":
 
 # ================================================================ Bar chart
 elif active_view == "Bar chart":
-    st.subheader("Ranked counties")
+    st.subheader("Ranked jurisdictions")
 
     c1, c2, c3 = st.columns([2, 2, 1])
     sel_def = c1.selectbox("Duplicate definition", definitions, key="dupe_def")
     metric = c2.selectbox(
-        "Rank by", list(RANKABLE), format_func=lambda c: RANKABLE[c], key="chart_metric",
+        "Rank by", list(STACK_METRICS), format_func=lambda c: STACK_METRICS[c], key="chart_metric",
     )
     min_total = c3.number_input(
         "Min. total alerts", min_value=1, value=1, step=1, key="chart_min_total",
-        help="Ignore counties with fewer than this many alerts. Useful when ranking by "
-             "share % so low-volume counties sitting at 100% don't dominate the ranking.",
+        help="Ignore jurisdictions whose combined (Voterheads + Curate) alert count is below this.",
     )
 
     c4, c5 = st.columns([2, 2])
@@ -349,52 +417,61 @@ elif active_view == "Bar chart":
     n_rows = c5.slider("Rows to show", min_value=5, max_value=50, value=20, step=5, key="chart_rows")
     ascending = order.startswith("Bottom")
 
-    chart_df = filtered[(filtered["definition"] == sel_def)
-                        & (filtered["total_alerts"] >= min_total)].copy()
+    metric_label = STACK_METRICS[metric]
+    chart_df = filtered[filtered["definition"] == sel_def].copy()
+    chart_df["jurisdiction"] = (chart_df["county"].fillna("(no county)")
+                                + ", " + chart_df["state"].astype(str))
 
-    if chart_df.empty:
-        st.info("No rows match the current filters.")
+    # roll the two source rows up to the jurisdiction to rank and apply the min-alerts filter
+    juris = chart_df.groupby(["county", "state", "jurisdiction"], as_index=False).agg(
+        metric_total=(metric, "sum"),
+        alerts_total=("total_alerts", "sum"),
+    )
+    juris = juris[juris["alerts_total"] >= min_total]
+    juris = juris.sort_values("metric_total", ascending=ascending).head(n_rows)
+
+    if juris.empty:
+        st.info("No jurisdictions match the current filters.")
     else:
-        chart_df["label"] = (
-            chart_df["county"].fillna("(no county)")
-            + ", " + chart_df["state"].astype(str)
-            + " (" + chart_df["source"] + ")"
-        )
-        rows = chart_df.sort_values(metric, ascending=ascending).head(n_rows)
-        st.markdown(f"**{'Bottom' if ascending else 'Top'} {len(rows)} by {RANKABLE[metric]}**")
-        if alerts is not None:
-            st.caption("Tip: click a bar to open its underlying alerts in the Raw Alerts Viewer.")
+        # per-source rows for the selected jurisdictions -> the stacked segments (+ jurisdiction total)
+        plot = chart_df.merge(juris[["county", "state", "metric_total"]], on=["county", "state"])
+        order_list = juris["jurisdiction"].tolist()  # largest-first (top) or smallest-first (bottom)
 
-        click_sel = alt.selection_point(fields=["county", "state", "source"],
-                                        on="click", name="barsel", empty=False)
+        st.markdown(f"**{'Bottom' if ascending else 'Top'} {len(juris)} jurisdictions by {metric_label}** "
+                    "— each bar stacks Voterheads + Curate")
+        if alerts is not None:
+            st.caption("Tip: click a bar to open that jurisdiction's underlying alerts in the Raw Alerts Viewer.")
+
+        click_sel = alt.selection_point(fields=["county", "state"], on="click", name="barsel", empty=False)
         chart = (
-            alt.Chart(rows)
+            alt.Chart(plot)
             .mark_bar()
             .encode(
-                x=alt.X(f"{metric}:Q", title=RANKABLE[metric]),
-                y=alt.Y("label:N", sort=("x" if ascending else "-x"), title=None),
+                x=alt.X(f"{metric}:Q", title=metric_label, stack="zero"),
+                y=alt.Y("jurisdiction:N", sort=order_list, title=None),
                 color=alt.Color("source:N", title="Source"),
                 tooltip=[
-                    alt.Tooltip("county:N"),
-                    alt.Tooltip("state:N"),
-                    alt.Tooltip("source:N"),
-                    *[alt.Tooltip(f"{c}:Q", title=lbl) for c, lbl in COUNT_LABELS.items()],
-                    alt.Tooltip(f"{PCT_COL}:Q", title=PCT_LABEL, format=".1f"),
+                    alt.Tooltip("jurisdiction:N", title="Jurisdiction"),
+                    alt.Tooltip("source:N", title="Source"),
+                    alt.Tooltip(f"{metric}:Q", title=metric_label),
+                    alt.Tooltip("metric_total:Q", title=f"{metric_label} (total)"),
                 ],
             )
             .add_params(click_sel)
-            .properties(height=max(300, 26 * len(rows)))
+            .properties(height=max(300, 30 * len(juris)))
         )
         st.altair_chart(chart, width="stretch", on_select=_handle_chart_click, key="chart_select")
 
-        with st.expander(f"Show these {len(rows)} rows as a table"):
-            render_dataframe(
-                rows[["county", "state", "source", "total_alerts", "dupes_between_vh_curate",
-                      PCT_COL, "dupe_alerts_received_first", "dupe_alerts_received_same_date",
-                      "dupes_within_source"]],
-                width="stretch", hide_index=True,
-                column_config={PCT_COL: st.column_config.NumberColumn(PCT_LABEL, format="%.1f%%")},
-            )
+        with st.expander(f"Show these {len(juris)} jurisdictions as a table"):
+            pv = (plot.pivot_table(index=["county", "state"], columns="source",
+                                   values=metric, fill_value=0, aggfunc="sum").reset_index())
+            for s in ("Voterheads", "Curate"):
+                if s not in pv.columns:
+                    pv[s] = 0
+            pv["Total"] = pv["Voterheads"] + pv["Curate"]
+            pv = pv.sort_values("Total", ascending=ascending).rename(columns={
+                "Voterheads": f"{metric_label} — VH", "Curate": f"{metric_label} — Curate"})
+            render_dataframe(pv, width="stretch", hide_index=True)
 
 # ================================================================ Raw Alerts Viewer
 elif active_view == "Raw Alerts Viewer":
@@ -409,6 +486,11 @@ elif active_view == "Raw Alerts Viewer":
                  "Your choice carries across all tabs.",
         )
         key_cols = DEFINITION_KEYS.get(raw_def, [])
+        dupes_only = st.toggle(
+            "Show only duplicates", key="raw_dupes_only",
+            help="Filter the table to just the rows that belong to a duplicate set under the "
+                 "selected definition — the shaded rows.",
+        )
 
         focus = st.session_state.get("raw_focus")
         if focus and any(v is not None for v in focus.values()):
@@ -430,12 +512,20 @@ elif active_view == "Raw Alerts Viewer":
         view = view.sort_values(sort_cols, na_position="last").reset_index(drop=True)
         view = view[[c for c in RAW_DISPLAY_COLS if c in view.columns]]
 
-        n_dupes = sum(1 for g in dupe_group_ordinals(view, key_cols) if g >= 0) if len(view) else 0
-        st.caption(f"{len(view):,} alerts · {n_dupes:,} in a duplicate set under **{raw_def}** "
-                   "(shaded; click a header to sort)")
+        ordinals = dupe_group_ordinals(view, key_cols) if len(view) else []
+        is_dupe = pd.Series([g >= 0 for g in ordinals], index=view.index, dtype=bool)
+        n_total, n_dupes = len(view), int(is_dupe.sum())
+        if dupes_only:
+            view = view[is_dupe].reset_index(drop=True)
+            st.caption(f"Showing {len(view):,} duplicate alerts (of {n_total:,}) under "
+                       f"**{raw_def}** (shaded; click a header to sort)")
+        else:
+            st.caption(f"{n_total:,} alerts · {n_dupes:,} in a duplicate set under **{raw_def}** "
+                       "(shaded; click a header to sort)")
 
         if len(view) == 0:
-            st.info("No alerts match the current filters.")
+            st.info("No duplicate alerts under this definition match the current filters." if dupes_only
+                    else "No alerts match the current filters.")
         elif len(view) <= DUPE_HIGHLIGHT_CAP:
             st.dataframe(style_alerts(view, key_cols), width="stretch", hide_index=True)
         else:
@@ -447,6 +537,8 @@ elif active_view == "Raw Alerts Viewer":
 # ================================================================ About
 elif active_view == "About the metrics":
     st.subheader("What the definitions and metrics mean")
+    if DATE_RANGE_MD:
+        st.markdown(DATE_RANGE_MD, unsafe_allow_html=True)
 
     st.markdown(
         """
